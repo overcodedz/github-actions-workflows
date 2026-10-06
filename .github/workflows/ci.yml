@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        type: string
+        default: "./Dockerfile"
+        description: Path to the Dockerfile relative to the repository root.
+      dockerfile_target:
+        type: string
+        default: ""
+        description: Build target for multi-stage Dockerfiles.
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-and-push:
+    name: Build, push & notify
+    runs-on: [self-hosted, overcodedz, manual]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: rc tags derive from `git rev-list --count`, which needs it.
+          # The default shallow clone has exactly one commit, so the count is always
+          # 1 and every rc/** branch builds `<version>-rc.1`. Two rc builds at the
+          # same version then collide on the tag and ArgoCD Image Updater has
+          # nothing newer to advance to -- it stops deploying, silently.
+          # enterprise-ci.yml has carried this since it was written.
+          fetch-depth: 0
+
+      - name: Resolve version & compute tags
+        id: tags
+        # `${{ ... }}` is substituted into the script as raw text BEFORE bash
+        # parses it, so any context value that lands in a `run:` body is code,
+        # not data. Branch names are attacker-chosen and git permits `$`, a
+        # backtick, `;`, `|` and `&&` in a refname — so `${{ github.ref }}`
+        # inline meant a branch called `rc/x$(...)` executed on this runner,
+        # which holds the Harbor push credentials. Passing the values through
+        # `env:` makes bash read them as ordinary strings.
+        #
+        # Rule for this file: nothing from the `github` or `inputs` contexts may
+        # appear inside a `run:` body. Add it here instead.
+        env:
+          REF: ${{ github.ref }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          # --- resolve version from project metadata, fall back to short SHA ---
+          VERSION=""
+          if [ -f "package.json" ]; then
+            VERSION=$(python3 -c "import json; v=json.load(open('package.json')).get('version'); print(v or '')") || VERSION=""
+          fi
+          if [ -z "$VERSION" ] && [ -f "pyproject.toml" ]; then
+            VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project'].get('version',''))") || VERSION=""
+          fi
+          if [ -z "$VERSION" ] && [ -f "Cargo.toml" ]; then
+            VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          fi
+          [ -n "$VERSION" ] || VERSION="$(git rev-parse --short HEAD)"
+
+          # --- branch-scoped tag strategy ---
+          BASE="harbor.internal.minhdq.dev/overcoded/${REPO_NAME}"
+          TAGS=()
+          if [ "$REF" = "refs/heads/develop" ]; then
+            # DEV: dev-<short_sha>  →  ArgoCD latest strategy, regexp:^dev-.*$
+            TAGS+=("${BASE}:dev-$(git rev-parse --short HEAD)")
+          elif echo "$REF" | grep -qE "^refs/heads/rc/"; then
+            # UAT: <version>-rc.<commit_count>  →  ArgoCD semver strategy, regexp:^.*-rc\.[0-9]+$
+            # git rev-list --count HEAD gives a per-branch monotonic number with no gaps
+            # from unrelated branches (unlike github.run_number which is repo-wide).
+            TAGS+=("${BASE}:${VERSION}-rc.$(git rev-list --count HEAD)")
+          elif [ "$REF" = "refs/heads/main" ] || [ "$REF" = "refs/heads/master" ]; then
+            # PROD: <version> + latest  →  ArgoCD semver strategy
+            TAGS+=("${BASE}:${VERSION}")
+            TAGS+=("${BASE}:latest")
+          fi
+
+          {
+            echo "version=$VERSION"
+            echo "tags<<EOF"
+            printf '%s\n' "${TAGS[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Pull BuildKit from Harbor's docker-hub proxy-cache (internal, no rate limit)
+          # instead of Docker Hub — saves the cold-pod buildkit pull on every job.
+          driver-opts: image=harbor.internal.minhdq.dev/docker-hub/moby/buildkit:buildx-stable-1
+
+      - name: Log in to Harbor
+        run: echo "$HARBOR_PASSWORD" | docker login harbor.internal.minhdq.dev --username "$HARBOR_USERNAME" --password-stdin
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          target: ${{ inputs.dockerfile_target }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          provenance: false
+          cache-from: type=registry,ref=harbor.internal.minhdq.dev/overcoded/${{ github.event.repository.name }}:buildcache
+          cache-to: type=registry,ref=harbor.internal.minhdq.dev/overcoded/${{ github.event.repository.name }}:buildcache,mode=max
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.tags.outputs.tags }}
+          VERSION: ${{ steps.tags.outputs.version }}
+          # REF_NAME is attacker-controlled in exactly the same way as `github.ref`
+          # above; the rest are constrained by GitHub but go through env too, so
+          # the "no context interpolation inside run:" rule needs no exceptions
+          # for a reader to check.
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Image published to Harbor :rocket:"
+            echo ""
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| **Version** | \`${VERSION}\` |"
+            echo "| **Run** | [#${RUN_NUMBER}](${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}) |"
+            echo "| **Ref** | \`${REF_NAME}\` |"
+            echo "| **Commit** | \`${GITHUB_SHA:0:7}\` |"
+            echo ""
+            echo "**Tags pushed:**"
+            echo ""
+            while IFS= read -r tag; do
+              [ -n "$tag" ] && echo "- \`${tag}\`"
+            done <<< "$TAGS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Send success notification
+        continue-on-error: true
+        env:
+          NOTIHUB_URL: https://notihub.internal.minhdq.dev
+          PROJECT_NAME: ${{ github.event.repository.name }}
+          WORKFLOW: ${{ github.workflow }}
+          RUN_NUMBER: ${{ github.run_number }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_ID: ${{ github.run_id }}
+          VERSION: ${{ steps.tags.outputs.version }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          # jq + curl are baked into the runner image — avoids a Node action download.
+          # NOTIHUB_API_KEY is injected into the runner via envFrom (notihub-credentials
+          # secret) — same mechanism as HARBOR_USERNAME/HARBOR_PASSWORD above.
+          if [ -z "${NOTIHUB_API_KEY:-}" ]; then
+            echo "::warning::NOTIHUB_API_KEY not set on runner; skipping notification"
+            exit 0
+          fi
+          TAGS_LIST=$(while IFS= read -r tag; do [ -n "$tag" ] && printf '  • %s\n' "$tag"; done <<< "$TAGS")
+          MESSAGE=$(printf 'Workflow: %s\nRun #%s on %s\nCommit: %s\nVersion: %s\nTags:\n%s' \
+            "$WORKFLOW" "$RUN_NUMBER" "$REF_NAME" "${GITHUB_SHA:0:7}" "$VERSION" "$TAGS_LIST")
+          jq -n \
+            --arg traceNo "github-run-${RUN_ID}" \
+            --arg origin "$PROJECT_NAME" \
+            --arg title "✅ ${PROJECT_NAME} — CI/CD succeeded" \
+            --arg message "$MESSAGE" \
+            '{traceNo: $traceNo, origin: $origin, level: "INFO", routeTo: {type: "TELEGRAM_CHANNEL"}, data: {title: $title, message: $message}}' \
+          | curl -fsS -m 10 -X POST "${NOTIHUB_URL%/}/api/v1/notifications/" \
+              -H 'Content-Type: application/json' \
+              -H "x-api-key: ${NOTIHUB_API_KEY}" \
+              --data-binary @-

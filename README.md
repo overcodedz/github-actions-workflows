@@ -1,0 +1,115 @@
+# github-actions-workflows
+
+Org-wide reusable GitHub Actions workflows for `overcodedz`.
+
+## Available Workflows
+
+### `enterprise-ci.yml` — Docker CI with security gates
+
+Same tag strategy as `ci.yml`, plus gitleaks, hadolint and Semgrep gates before the build, then a Trivy scan, a CycloneDX SBOM and cosign signing of the pushed image. Every stage has an input to turn it off.
+
+```yaml
+jobs:
+  ci:
+    uses: overcodedz/github-actions-workflows/.github/workflows/enterprise-ci.yml@main
+```
+
+The cosign public key for verifying signed images is `cosign.pub`.
+
+### `ci.yml` — Docker CI
+
+Builds and pushes a Docker image to Harbor, then sends a success notification to NotiHub.
+Branch is detected at runtime to apply the correct tag strategy:
+
+| Branch | Tag produced | Environment | ArgoCD strategy |
+|--------|-------------|-------------|-----------------|
+| `develop` | `dev-<short_sha>` | DEV | `latest`, `regexp:^dev-.*$` |
+| `rc/<version>` | `<version>-rc.<commit_count>` | UAT | `semver`, `regexp:^.*-rc\.[0-9]+$` |
+| `main` / `master` | `<version>` + `latest` | PROD | `semver` |
+
+Version is resolved from `package.json`, `pyproject.toml`, or `Cargo.toml`. Falls back to
+the short commit SHA if none are present.
+
+**Name RC branches after the version they release** — `rc/0.1.120`, not `rc/my-feature`. The
+workflow triggers on `rc/**` so any name builds, but the branch name is how anyone reading the
+branch list knows which release is in UAT.
+
+`<commit_count>` is `git rev-list --count HEAD`, **not** `github.run_number`: it is per-branch
+monotonic with no gaps from unrelated branches. This is why the checkout step sets
+`fetch-depth: 0` — under the default shallow clone the count is always `1`, every RC builds
+`<version>-rc.1`, and ArgoCD Image Updater sees no newer tag and silently stops deploying.
+
+It also means **the version must be bumped for each new RC of the same release**. Two RC builds at
+the same version and commit count collide on the tag; the second overwrites the first and nothing
+deploys.
+
+#### Usage
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [develop, main, "rc/**"]
+
+jobs:
+  ci:
+    uses: overcodedz/github-actions-workflows/.github/workflows/ci.yml@main
+```
+
+#### Inputs
+
+| Input | Default | Description |
+|-------|---------|-------------|
+| `dockerfile` | `./Dockerfile` | Path to the Dockerfile |
+| `dockerfile_target` | `""` | Build target for multi-stage Dockerfiles |
+
+#### Custom Dockerfile path
+
+```yaml
+jobs:
+  ci:
+    uses: overcodedz/github-actions-workflows/.github/workflows/ci.yml@main
+    with:
+      dockerfile: ./deploy/dockerfile
+```
+
+#### Multi-stage build target
+
+```yaml
+jobs:
+  ci:
+    uses: overcodedz/github-actions-workflows/.github/workflows/ci.yml@main
+    with:
+      dockerfile_target: production
+```
+
+#### Test prerequisite before Docker build
+
+```yaml
+jobs:
+  test:
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, overcodedz, manual]
+    steps:
+      - uses: actions/checkout@v4
+      - run: bun install --frozen-lockfile
+      - run: bun test --coverage
+
+  ci:
+    needs: [test]
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    uses: overcodedz/github-actions-workflows/.github/workflows/ci.yml@main
+```
+
+## Requirements
+
+- **Runner**: `[self-hosted, overcodedz, manual]` with credentials injected via `envFrom` on the runner pod: `HARBOR_USERNAME`/`HARBOR_PASSWORD`, `NOTIHUB_API_KEY` and, for `enterprise-ci.yml`, `COSIGN_PRIVATE_KEY`/`COSIGN_PASSWORD`.
+- **Registry**: `harbor.internal.minhdq.dev/overcoded/<repo-name>`
+- **Build cache**: stored at `harbor.internal.minhdq.dev/overcoded/<repo-name>:buildcache`
+
+## Further reading
+
+- [Shared CI Workflows standard](https://github.com/minhdqdev-org/engineering-docs/blob/main/docs/design-guidelines/shared-ci-workflows.md)
+- [ArgoCD Image Updater standard](https://github.com/minhdqdev-org/engineering-docs/blob/main/docs/design-guidelines/argocd-image-updater.md)
